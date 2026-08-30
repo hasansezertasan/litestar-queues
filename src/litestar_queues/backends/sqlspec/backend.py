@@ -2032,7 +2032,7 @@ class SQLSpecQueueBackend(BaseQueueBackend):
     def _resolve_queue_table_name(self) -> "str":
         if self._queue_table_name is None:
             queue_settings = _queue_extension_settings(self._sqlspec_config)
-            configured_table_name = _setting(queue_settings, "table_name") or DEFAULT_TABLE_NAME
+            configured_table_name = _setting(queue_settings, "queue_table_name") or DEFAULT_TABLE_NAME
             self._queue_table_name = validate_table_name(str(configured_table_name))
         return self._queue_table_name
 
@@ -2615,15 +2615,29 @@ class _ManagedAsyncDriver:
         self._transaction_finalized = False
         if self._skip_explicit_begin:
             return None
-        return await async_(self._driver.begin, executor=self._executor)()
+        try:
+            return await async_(self._driver.begin, executor=self._executor)()
+        except RuntimeError:
+            begin = getattr(self._driver, "begin", None)
+            if callable(begin):
+                return begin()
+            return None
 
     async def commit(self) -> "Any":
-        result = await async_(self._driver.commit, executor=self._executor)()
+        try:
+            result = await async_(self._driver.commit, executor=self._executor)()
+        except RuntimeError:
+            commit = getattr(self._driver, "commit", None)
+            result = commit() if callable(commit) else None
         self._transaction_finalized = True
         return result
 
     async def rollback(self) -> "Any":
-        result = await async_(self._driver.rollback, executor=self._executor)()
+        try:
+            result = await async_(self._driver.rollback, executor=self._executor)()
+        except RuntimeError:
+            rollback = getattr(self._driver, "rollback", None)
+            result = rollback() if callable(rollback) else None
         self._transaction_finalized = True
         return result
 
@@ -2695,15 +2709,27 @@ async def _bridge_session(
             except BaseException as exc:
                 if not managed_driver.transaction_finalized and not skip_cleanup_rollback:
                     await _rollback_sync_session(driver, executor=sync_executor)
-                if not await async_(session_cm.__exit__, executor=sync_executor)(type(exc), exc, exc.__traceback__):
+                if not await _exit_sync_session(session_cm, type(exc), exc, exc.__traceback__, executor=sync_executor):
                     raise
             else:
                 if not managed_driver.transaction_finalized and not skip_cleanup_rollback:
                     await _rollback_sync_session(driver, executor=sync_executor)
-                await async_(session_cm.__exit__, executor=sync_executor)(None, None, None)
+                await _exit_sync_session(session_cm, None, None, None, executor=sync_executor)
         finally:
             if owns_executor:
                 sync_executor.shutdown(wait=True)
+
+
+async def _exit_sync_session(
+    session_cm: "Any", exc_type: "Any", exc_val: "Any", exc_tb: "Any", *, executor: "ThreadPoolExecutor | None" = None
+) -> "bool":
+    """Exit a sync SQLSpec session with fallback to direct call if executor is shut down."""
+    try:
+        return bool(await async_(session_cm.__exit__, executor=executor)(exc_type, exc_val, exc_tb))
+    except RuntimeError:
+        with suppress(Exception):
+            return bool(session_cm.__exit__(exc_type, exc_val, exc_tb))
+        return False
 
 
 async def _rollback_sync_session(driver: "object", *, executor: "ThreadPoolExecutor | None" = None) -> "None":
@@ -2711,7 +2737,10 @@ async def _rollback_sync_session(driver: "object", *, executor: "ThreadPoolExecu
     rollback = getattr(driver, "rollback", None)
     if callable(rollback):
         with suppress(Exception):
-            await async_(rollback, executor=executor)()
+            try:
+                await async_(rollback, executor=executor)()
+            except RuntimeError:
+                rollback()
 
 
 async def _select_stream(
