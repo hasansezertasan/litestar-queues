@@ -1,6 +1,7 @@
 """Advanced Alchemy queue backend."""
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -28,7 +29,7 @@ from litestar_queues.backends.advanced_alchemy.service import (
     QueueTaskReservationService,
     QueueTaskService,
 )
-from litestar_queues.backends.base import BaseQueueBackend
+from litestar_queues.backends.base import BaseQueueBackend, DispatchRepairCandidates
 from litestar_queues.exceptions import QueueConfigurationError
 from litestar_queues.models import HeartbeatTouchResult, QueueBackendCapabilities, TaskReservation
 from litestar_queues.observability import create_observability_runtime
@@ -145,12 +146,28 @@ class SQLAlchemyBackend(BaseQueueBackend):
 
     async def close(self) -> "None":
         """Close backend-owned resources."""
-        if self._notification_listener is not None:
-            await self._notification_listener.close()
-            self._notification_listener = None
-        if self._event_log is not None:
-            await self._event_log.flush_events()
-        self._opened = False
+        event_log, self._event_log = self._event_log, None
+        listener, self._notification_listener = self._notification_listener, None
+        primary: BaseException | None = None
+        try:
+            if event_log is not None:
+                try:
+                    await event_log.aclose()
+                except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - finish listener cleanup first.
+                    primary = error
+            if listener is not None:
+                try:
+                    await listener.close()
+                except (Exception, asyncio.CancelledError) as error:
+                    if primary is None or isinstance(error, asyncio.CancelledError):
+                        primary = error
+                    else:
+                        with suppress(Exception):
+                            self._logger.warning("Advanced Alchemy notification cleanup also failed", exc_info=True)
+        finally:
+            self._opened = False
+        if primary is not None:
+            raise primary
 
     def get_event_log(self, config: "EventHistoryConfig") -> "AdvancedAlchemyQueueEventLog":
         """Return Advanced Alchemy-managed queue event history."""
@@ -424,6 +441,41 @@ class SQLAlchemyBackend(BaseQueueBackend):
         async with self._operation() as service:
             return await service.set_execution_ref(
                 task_id, execution_backend, execution_ref, execution_profile=execution_profile
+            )
+
+    async def list_dispatch_repair_candidates(
+        self, execution_backend: "str", *, limit: "int"
+    ) -> "DispatchRepairCandidates":
+        """Commit examination marks before exposing bounded repair candidates.
+
+        Raises:
+            QueueConfigurationError: If the limit is negative.
+        """
+        if limit < 0:
+            message = "Dispatch repair limit must be non-negative."
+            raise QueueConfigurationError(message)
+        if limit == 0:
+            return DispatchRepairCandidates()
+        async with self._operation() as service:
+            return await service.list_dispatch_repair_candidates(execution_backend, limit=limit)
+
+    async def reserve_scheduled_execution_ref(
+        self,
+        task_id: "UUID",
+        execution_backend: "str",
+        execution_ref: "str",
+        *,
+        expected_retry_count: "int",
+        expected_execution_ref: "str | None",
+    ) -> "QueuedTaskRecord | None":
+        """Atomically reserve the exact active attempt, including future tasks."""
+        async with self._operation() as service:
+            return await service.reserve_scheduled_execution_ref(
+                task_id,
+                execution_backend,
+                execution_ref,
+                expected_retry_count=expected_retry_count,
+                expected_execution_ref=expected_execution_ref,
             )
 
     async def reserve_external_dispatch(
@@ -711,6 +763,7 @@ class SQLAlchemyBackend(BaseQueueBackend):
             "started_at",
             "completed_at",
             "heartbeat_at",
+            "dispatch_checked_at",
             "result_json",
             "error",
             "task_key",

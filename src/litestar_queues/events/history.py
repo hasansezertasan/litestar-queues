@@ -1,12 +1,13 @@
 """Backend-owned queue event history contracts."""
 
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import TYPE_CHECKING, Any, Protocol
 
 from litestar_queues.exceptions import QueueConfigurationError
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
     from datetime import datetime
 
     from litestar_queues.events.models import QueueEvent
@@ -185,7 +186,7 @@ class EventHistoryConfig:
     """Maximum history records written in one batch."""
 
     flush_interval: "float" = 1.0
-    """Maximum delay between history batch writes in seconds."""
+    """Delay before scheduling the oldest pending history batch, in seconds."""
 
     strict: "bool" = False
     """Whether event-history write failures propagate to the publisher."""
@@ -196,13 +197,19 @@ class EventHistoryConfig:
     extra_columns: "tuple[EventHistoryExtraColumn, ...]" = field(default_factory=tuple)
     """Adopter-declared scoping columns on the event-history table."""
 
+    max_pending: "int" = 2000
+    """Maximum accepted records awaiting persistence or live release."""
+
     def __post_init__(self) -> "None":
         """Validate event-history configuration."""
         if self.batch_size <= 0:
             msg = "EventHistoryConfig.batch_size must be greater than 0."
             raise QueueConfigurationError(msg)
-        if self.flush_interval <= 0:
-            msg = "EventHistoryConfig.flush_interval must be greater than 0."
+        if not isfinite(self.flush_interval) or self.flush_interval <= 0:
+            msg = "EventHistoryConfig.flush_interval must be finite and greater than 0."
+            raise QueueConfigurationError(msg)
+        if self.max_pending < self.batch_size:
+            msg = "EventHistoryConfig.max_pending must be at least batch_size."
             raise QueueConfigurationError(msg)
         if self.memory_capacity <= 0:
             msg = "EventHistoryConfig.memory_capacity must be greater than 0."
@@ -264,10 +271,24 @@ class QueueEventStageSummary:
 
 
 class QueueEventLog(Protocol):
-    """Backend-owned queue event history writer and query interface."""
+    """Backend-owned history with explicit commit acknowledgement and closure.
+
+    Custom providers must implement commit-aware publication and closure;
+    accepting an event through ``publish_event`` alone is not a commit signal.
+    """
 
     async def publish_event(self, event: "QueueEvent") -> "None": ...
+    async def publish_event_after_commit(
+        self, event: "QueueEvent", *, release: "Callable[[], Awaitable[None]]", barrier: "bool" = False
+    ) -> "None":
+        """Release live delivery after commitment, waiting through a barrier when requested."""
+        ...
+
     async def flush_events(self) -> "None": ...
+    async def aclose(self) -> "None":
+        """Finish owned history work and release its lifecycle resources."""
+        ...
+
     async def query_events(
         self, query: "QueueEventQuery | None" = None, *, extra: "Mapping[str, str] | None" = None
     ) -> "OffsetPagination[QueueEventLogRecord]": ...

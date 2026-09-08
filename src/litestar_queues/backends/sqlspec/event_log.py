@@ -2,14 +2,15 @@
 
 import asyncio
 import logging
-import time
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 from hashlib import sha1
+from sqlite3 import IntegrityError as SQLiteIntegrityError
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlspec import sql
+from sqlspec.exceptions import SQLSpecError, UniqueViolationError
 from sqlspec.utils.text import quote_backtick_identifier, quote_identifier, split_qualified_identifier
 
 from litestar_queues.backends.sqlspec.schema import (
@@ -22,14 +23,16 @@ from litestar_queues.backends.sqlspec.stores.spanner import SpannerQueueStore
 from litestar_queues.events import (
     EventHistoryExtraColumn,
     event_actor_key,
-    event_entity_key,
     validate_event_extra_filter,
     validate_event_history_extra_columns,
 )
+from litestar_queues.events._history_buffer import _HistoryBuffer
+from litestar_queues.events._log_records import event_log_record_from_event
 from litestar_queues.events.history import EventHistoryConfig, QueueEventLogRecord, QueueEventStageSummary
+from litestar_queues.exceptions import QueueConfigurationError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
 
     from sqlspec.builder import CreateIndex, CreateTable, Delete, DropIndex, DropTable, Select
@@ -48,6 +51,7 @@ __all__ = (
 )
 
 _PORTABLE_INDEX_NAME_LENGTH = 63
+_SQLITE_CONSTRAINT_PRIMARYKEY = 1555
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +192,12 @@ class SQLSpecQueueEventLogStore(SQLSpecQueueStore):
         placeholders = ", ".join(f":{self.parameter_name(column)}" for column in names)
         return f"INSERT INTO {self._quoted_table_name()} ({columns}) VALUES ({placeholders})"  # noqa: S608
 
+    def select_existing_event_ids(self, event_ids: "Sequence[str]") -> "Select":
+        """Fetch immutable content for one bounded replay lookup."""
+        return (
+            sql.select(*self._select_columns()).from_(self.table_name).where_in(self._col("event_id"), list(event_ids))
+        )
+
     def parameter_name(self, column: "str") -> "str":
         """Return the bind parameter name for a public event column."""
         return self._col(column)
@@ -195,40 +205,13 @@ class SQLSpecQueueEventLogStore(SQLSpecQueueStore):
     def _select_columns(self) -> "tuple[Any, ...]":
         return tuple(self._col(column) if self._col(column) != column else column for column in self._all_columns())
 
-    def select_events(  # noqa: C901
-        self, query: "QueueEventQuery", extra: "Mapping[str, str] | None" = None
-    ) -> "Select":
+    def select_events(self, query: "QueueEventQuery", extra: "Mapping[str, str] | None" = None) -> "Select":
         """Return a SELECT for event-log records.
 
         Raises:
             ValueError: If ``extra`` names a column that was not declared.
         """
-        filters = {}
-        if extra:
-            extra = dict(extra)
-            if "actor_id" in extra:
-                filters["actor_id"] = extra.pop("actor_id")
-            if "actor_type" in extra:
-                filters["actor_type"] = extra.pop("actor_type")
-            filters.update(self._validated_extra_filter(extra))
-        statement = sql.select(*self._select_columns()).from_(self.table_name)
-        if query.task_id is not None:
-            statement = statement.where_eq("task_id", query.task_id)
-        if query.task_name is not None:
-            statement = statement.where_eq("task_name", query.task_name)
-        if query.event_type is not None:
-            statement = statement.where_eq("event_type", query.event_type)
-        if query.level is not None:
-            statement = statement.where_eq(self._col("level"), query.level)
-        if query.scope is not None:
-            statement = statement.where_eq("scope", query.scope)
-        if query.scope_key is not None:
-            statement = statement.where_eq("scope_key", query.scope_key)
-        if query.entity is not None:
-            statement = statement.where_eq("entity", query.entity)
-
-        for name, value in filters.items():
-            statement = statement.where_eq(name, value)
+        statement = self._filter_events(sql.select(*self._select_columns()).from_(self.table_name), query, extra)
 
         if query.order == "asc":
             statement = statement.order_by(
@@ -242,6 +225,24 @@ class SQLSpecQueueEventLogStore(SQLSpecQueueStore):
         if query.offset:
             statement = statement.offset(query.offset)
         return statement.limit(query.limit) if query.limit is not None else statement
+
+    def count_events(self, query: "QueueEventQuery", extra: "Mapping[str, str] | None" = None) -> "Select":
+        """Count matching event-log records before ordering and pagination."""
+        return self._filter_events(sql.select(sql.count("*").as_("total")).from_(self.table_name), query, extra)
+
+    def _filter_events(
+        self, statement: "Select", query: "QueueEventQuery", extra: "Mapping[str, str] | None"
+    ) -> "Select":
+        filters = dict(query.filters())
+        if extra:
+            extra = dict(extra)
+            for name in ("actor_id", "actor_type"):
+                if name in extra:
+                    filters[name] = extra.pop(name)
+            filters.update(self._validated_extra_filter(extra))
+        for name, value in filters.items():
+            statement = statement.where_eq(self._col(name), value)
+        return statement
 
     def summarize_stages(self, *, task_name: "str | None" = None) -> "tuple[str, dict[str, Any]]":
         """Return SQL and parameters for per-stage event summaries."""
@@ -699,16 +700,7 @@ class SpannerQueueEventLogStore(SQLSpecQueueEventLogStore, SpannerQueueStore):
 class SQLSpecQueueEventLog:
     """Buffered SQLSpec event-history writer and query interface."""
 
-    __slots__ = (
-        "_config",
-        "_datetime_serializer",
-        "_flush_lock",
-        "_last_flush",
-        "_logger",
-        "_pending",
-        "_session_factory",
-        "_store",
-    )
+    __slots__ = ("_buffer", "_datetime_serializer", "_logger", "_session_factory", "_store")
 
     def __init__(
         self,
@@ -721,11 +713,8 @@ class SQLSpecQueueEventLog:
     ) -> "None":
         self._session_factory = session_factory
         self._datetime_serializer = datetime_serializer
-        self._config = config
         self._store = store
-        self._pending: "list[dict[str, Any]]" = []
-        self._last_flush = time.monotonic()
-        self._flush_lock = asyncio.Lock()
+        self._buffer = _HistoryBuffer(config, self._write_history_batch)
         self._logger = runtime_logger or logger
 
     @property
@@ -734,42 +723,156 @@ class SQLSpecQueueEventLog:
         return self._store.extra_columns
 
     async def publish_event(self, event: "QueueEvent") -> "None":
-        """Buffer a queue event and flush when configured thresholds are reached."""
-        should_flush = False
-        async with self._flush_lock:
-            self._pending.append(self._params_from_event(event))
-            should_flush = len(self._pending) >= max(1, self._config.batch_size) or self._flush_interval_elapsed()
-        if should_flush:
-            await self.flush_events()
+        """Accept an immutable event for bounded, timed persistence."""
+        await self._buffer.enqueue(self._record_from_event(event))
+
+    async def publish_event_after_commit(
+        self, event: "QueueEvent", *, release: "Callable[[], Awaitable[None]]", barrier: "bool" = False
+    ) -> "None":
+        """Release the live callback only after history commits."""
+        await self._buffer.enqueue(self._record_from_event(event), release=release, barrier=barrier)
 
     async def flush_events(self) -> "None":
-        """Flush buffered queue events through a SQLSpec session."""
-        async with self._flush_lock:
-            if not self._pending:
-                return
-            batch = list(self._pending)
+        """Attempt accepted history and its ordered live releases."""
+        await self._buffer.flush()
+
+    async def aclose(self) -> "None":
+        """Stop admission and finish the history coordinator before pool cleanup."""
+        await self._buffer.stop()
+
+    def _record_from_event(self, event: "QueueEvent") -> "QueueEventLogRecord":
+        record = event_log_record_from_event(event, extra_columns=self._store.extra_columns)
+        return replace(record, actor=event_actor_key(event.actor))
+
+    async def _write_history_batch(self, records: "Sequence[QueueEventLogRecord]") -> "None":
+        for attempt in range(2):
             try:
-                async with self._session_factory() as driver:
+                await self._write_transaction(records)
+            except Exception as exc:  # noqa: PERF203 - one bounded fresh-transaction retry for duplicate races.
+                if attempt == 0 and _is_duplicate_event_error(exc):
+                    continue
+                raise
+            else:
+                return
+
+    async def _write_transaction(self, records: "Sequence[QueueEventLogRecord]") -> "None":
+        primary: BaseException | None = None
+        try:
+            async with self._session_factory() as driver:
+                try:
                     await driver.begin()
+                    await self._insert_missing_records(driver, records)
+                    await driver.commit()
+                except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+                    primary = exc
                     try:
-                        await driver.execute_many(self._store.insert_events_template(), batch)
-                        await driver.commit()
+                        await driver.rollback()
+                    except asyncio.CancelledError as cancelled:
+                        primary = cancelled
                     except Exception:
                         with suppress(Exception):
-                            await driver.rollback()
-                        raise
-            except Exception:
-                if self._config.strict:
-                    raise
-                self._logger.warning("SQLSpec queue event history flush failed", exc_info=True)
-                return
-            del self._pending[: len(batch)]
-            self._last_flush = time.monotonic()
+                            self._logger.warning("SQLSpec event history rollback failed", exc_info=True)
+                    raise primary from primary.__cause__
+        except BaseException as cleanup:
+            if isinstance(cleanup, asyncio.CancelledError):
+                raise
+            if primary is not None:
+                if cleanup is not primary:
+                    with suppress(Exception):
+                        self._logger.warning("SQLSpec event history session cleanup also failed", exc_info=True)
+                raise primary from primary.__cause__
+            raise
+        if primary is not None:
+            raise primary
+
+    async def _insert_missing_records(
+        self, driver: "SQLSpecDriver", records: "Sequence[QueueEventLogRecord]"
+    ) -> "None":
+        incoming: dict[str, tuple[QueueEventLogRecord, dict[str, Any]]] = {}
+        for record in records:
+            params = self._params_from_record(record)
+            canonical = self._record_from_row(params)
+            previous = incoming.get(record.event_id)
+            if previous is not None:
+                normalized = await self._comparison_records(driver, (previous[0], canonical))
+                _require_identical_event(*normalized)
+            else:
+                incoming[record.event_id] = (canonical, params)
+        missing = dict(incoming)
+        event_ids = tuple(incoming)
+        # SQLite's traditional 999-bind limit and Oracle's 1000-item IN limit
+        # both exceed this fixed lookup bound, even for a large configured batch.
+        for start in range(0, len(event_ids), 500):
+            rows = await driver.select(self._store.select_existing_event_ids(event_ids[start : start + 500]))
+            existing = [self._record_from_row(cast("dict[str, Any]", row)) for row in rows]
+            compared = await self._comparison_records(driver, [incoming[record.event_id][0] for record in existing])
+            for stored, candidate in zip(existing, compared, strict=True):
+                # Reapply the bind codec (e.g. millisecond text on Arrow ODBC)
+                # to both sides while keeping stored created_at untouched.
+                stored = self._record_from_row(self._params_from_record(stored))
+                _require_identical_event(stored, candidate)
+                missing.pop(stored.event_id, None)
+        if missing:
+            statement = self._store.insert_events_template()
+            values = [item[1] for item in missing.values()]
+            if _adapter_name(self._store._config) == "arrow_odbc":  # noqa: SLF001
+                # Arrow ODBC has no row-oriented executemany. Keep these bound
+                # inserts inside the caller's single explicit transaction.
+                for params in values:
+                    await driver.execute(statement, params)
+            else:
+                await driver.execute_many(statement, values)
+
+    async def _comparison_records(
+        self, driver: "SQLSpecDriver", records: "Sequence[QueueEventLogRecord]"
+    ) -> "list[QueueEventLogRecord]":
+        if not records:
+            return list(records)
+        dialect = self._store._event_dialect_name()  # noqa: SLF001
+        float_type = self._store._float_type()  # noqa: SLF001
+        normalized: list[QueueEventLogRecord] = []
+        # Match both timestamp and numeric storage precision. Restrict casts to
+        # compared records, with at most 500 binds per projection.
+        for start in range(0, len(records), 100):
+            batch = records[start : start + 100]
+            parameters: dict[str, Any] = {}
+            projections = []
+            changes: list[dict[str, Any]] = [{} for _ in batch]
+            bindings: list[tuple[int, str, str]] = []
+            for index, record in enumerate(batch):
+                columns = [
+                    (column, getattr(record, column), float_type)
+                    for column in ("progress_current", "progress_total", "progress_percent", "duration_ms")
+                    if getattr(record, column) is not None
+                ]
+                if dialect == "mysql":
+                    columns.append(("occurred_at", self._datetime_serializer(record.occurred_at), "DATETIME"))
+                for column, value, data_type in columns:
+                    name = f"value_{len(parameters)}"
+                    parameters[name] = value
+                    projections.append(f"CAST(:{name} AS {data_type}) AS {name}")
+                    bindings.append((index, column, name))
+            if parameters:
+                statement = "SELECT " + ", ".join(projections)
+                if dialect == "oracle":
+                    statement += " FROM DUAL"
+                rows = await driver.select(statement, parameters)
+                for index, column, name in bindings:
+                    value = rows[0][name]
+                    changes[index][column] = (
+                        _deserialize_datetime(value) if column == "occurred_at" else _optional_float(value)
+                    )
+            normalized.extend(replace(record, **change) for record, change in zip(batch, changes, strict=True))
+        return normalized
 
     async def query_events(
         self, query: "QueueEventQuery | None" = None, *, extra: "Mapping[str, str] | None" = None
     ) -> "OffsetPagination[QueueEventLogRecord]":
-        """Query durable event history records."""
+        """Query durable event history with the total before pagination.
+
+        Page and count statements share a session; their consistency under
+        concurrent writes follows the configured transaction isolation.
+        """
         from litestar_queues.events.query import QueueEventQuery
         from litestar_queues.events.typing import OffsetPagination
 
@@ -777,13 +880,13 @@ class SQLSpecQueueEventLog:
         await self.flush_events()
         async with self._session_factory() as driver:
             rows = await driver.select(self._store.select_events(query, extra=extra))
-            # count query to get total
-            # wait, how to get total for sqlspec? There's no count method right now.
-            # let's just make it length of rows for now to get it compiling
+            count_rows = await driver.select(self._store.count_events(query, extra=extra))
         records = [self._record_from_row(cast("dict[str, Any]", row)) for row in rows]
-        page_items = records[: query.limit] if query.limit else records
         return OffsetPagination(
-            items=page_items, total=len(records), offset=query.offset, limit=query.limit or len(page_items) or 1
+            items=records,
+            total=int(count_rows[0]["total"]),
+            offset=query.offset,
+            limit=query.limit or len(records) or 1,
         )
 
     async def summarize_stages(self, query: "QueueEventQuery | None" = None) -> "list[QueueEventStageSummary]":
@@ -842,43 +945,17 @@ class SQLSpecQueueEventLog:
                 raise
         return deleted
 
-    def _flush_interval_elapsed(self) -> "bool":
-        return self._config.flush_interval <= 0 or time.monotonic() - self._last_flush >= self._config.flush_interval
-
-    def _params_from_event(self, event: "QueueEvent") -> "dict[str, Any]":
-        detail = dict(event.payload)
-        params: "dict[str, Any]" = {
-            "event_id": event.id,
-            "event_type": event.type,
-            "task_id": event.task_id,
-            "task_name": event.task_name,
-            "queue": event.queue,
-            "worker_id": event.worker_id,
-            "execution_backend": event.execution_backend,
-            "execution_profile": event.execution_profile,
-            "actor_type": event.actor.type if event.actor is not None else None,
-            "actor_id": event.actor.id if event.actor is not None else None,
-            "stage": _optional_str(detail.get("stage")),
-            "level": event.level,
-            "message": event.message,
-            "detail": self._store.serialize_detail(detail),
-            "progress_current": _optional_float(event.progress_current),
-            "progress_total": _optional_float(event.progress_total),
-            "progress_percent": _optional_float(event.progress_percent),
-            "duration_ms": _optional_float(detail.get("duration_ms")),
-            "sequence": event.sequence,
-            "occurred_at": self._datetime_serializer(event.occurred_at),
-            "created_at": self._datetime_serializer(datetime.now(timezone.utc)),
-            "scope": event.scope,
-            "scope_key": event.scope_key,
-            "actor": event_actor_key(event.actor),
-            "entity": event_entity_key(event.entity),
-        }
-        for column in self._store.extra_columns:
-            params[column.name] = _optional_str(detail.get(column.source))
+    def _params_from_record(self, record: "QueueEventLogRecord") -> "dict[str, Any]":
+        params = {column: getattr(record, column) for column in EVENT_HISTORY_COLUMNS}
+        params["detail"] = self._store.serialize_detail(record.detail)
+        params["occurred_at"] = self._datetime_serializer(record.occurred_at)
+        params["created_at"] = self._datetime_serializer(record.created_at)
+        params.update({column.name: record.extra.get(column.name) for column in self._store.extra_columns})
         level_parameter = self._store.parameter_name("level")
         if level_parameter != "level":
             params[level_parameter] = params.pop("level")
+        if self._store._event_dialect_name() == "oracle":  # noqa: SLF001
+            params = {key: None if value == "" else value for key, value in params.items()}
         return params
 
     def _record_from_row(self, row: "dict[str, Any]") -> "QueueEventLogRecord":
@@ -961,6 +1038,41 @@ def resolve_event_history_table_name(
     if event_history_table_name is not None:
         return validate_table_name(event_history_table_name)
     return event_history_table_name_for(queue_table_name)
+
+
+def _require_identical_event(stored: "QueueEventLogRecord", incoming: "QueueEventLogRecord") -> "None":
+    if any(
+        getattr(stored, field.name) != getattr(incoming, field.name)
+        for field in fields(stored)
+        if field.name != "created_at"
+    ):
+        message = f"Conflicting immutable queue event history record for event ID {incoming.event_id!r}."
+        raise QueueConfigurationError(message)
+
+
+def _is_duplicate_event_error(error: "BaseException") -> "bool":
+    """Return True if the error represents a duplicate primary-key or unique violation.
+
+    SQLSpec 0.62 maps SQLite's UNIQUE code (2067) but not its distinct PRIMARYKEY
+    code (1555). We inspect the native cause, context, and the mapped SQLSpecError message.
+    """
+    seen: set[int] = set()
+    while id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, UniqueViolationError):
+            return True
+        if (
+            isinstance(error, SQLiteIntegrityError)
+            and getattr(error, "sqlite_errorcode", None) == _SQLITE_CONSTRAINT_PRIMARYKEY
+        ):
+            return True
+        if isinstance(error, SQLSpecError) and f"[code {_SQLITE_CONSTRAINT_PRIMARYKEY}]" in str(error):
+            return True
+        cause = error.__cause__ or error.__context__
+        if cause is None:
+            return False
+        error = cause
+    return False
 
 
 def _deserialize_datetime(value: "Any") -> "datetime":

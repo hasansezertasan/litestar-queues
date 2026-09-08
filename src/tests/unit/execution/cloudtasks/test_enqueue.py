@@ -13,6 +13,8 @@ committed error over a record that is still there, still active, and still
 carrying the delivery name repair will look for.
 """
 
+import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -215,6 +217,160 @@ async def test_a_failed_delivery_keeps_the_identity_it_reserved(harness: "Callab
 
     assert again.id == excinfo.value.task_id
     assert (await live.service.get_queue_backend().get_statistics()).total == 1
+
+
+@pytest.mark.parametrize("failure_point", ["client", "reservation", "request", "storage_read"])
+async def test_post_commit_dispatch_failures_preserve_identity(
+    harness: "Callable[..., Any]", monkeypatch: "pytest.MonkeyPatch", failure_point: "str"
+) -> "None":
+    """Every dispatch stage fails with a durable identity, even if its diagnostic sink fails."""
+    from litestar_queues.execution.cloudtasks import backend as backend_module
+
+    live = await harness()
+    backend = live.service.get_execution_backend()
+    storage_type = type(live.service.get_queue_backend())
+    original_get_task = storage_type.get_task
+
+    async def fail_async(*_args: "Any", **_kwargs: "Any") -> "Any":
+        msg = "secret-target-and-credential"
+        raise RuntimeError(msg)
+
+    def fail_request(*_args: "Any", **_kwargs: "Any") -> "Any":
+        msg = "secret-target-and-credential"
+        raise RuntimeError(msg)
+
+    if failure_point == "storage_read":
+        monkeypatch.setattr(storage_type, "get_task", fail_async)
+    elif failure_point == "request":
+        monkeypatch.setattr(backend_module, "_create_task_request", fail_request)
+    else:
+        method = "_get_client" if failure_point == "client" else "_reserve_delivery_name"
+        monkeypatch.setattr(type(backend), method, fail_async)
+    monkeypatch.setattr(type(live.service.get_event_publisher()), "publish", fail_async)
+
+    with pytest.raises(QueueDispatchError) as excinfo:
+        await live.service.enqueue(probe)
+
+    error = excinfo.value
+    assert error.committed is True
+    assert "secret-target-and-credential" not in str(error)
+    assert error.task_id is not None
+    monkeypatch.setattr(storage_type, "get_task", original_get_task)
+    record = await live.reader.get_task(error.task_id)
+    assert record is not None and record.status == "pending"
+    assert (await live.service.get_queue_backend().get_statistics()).total == 1
+    assert live.client.create_calls == []
+
+
+@pytest.mark.parametrize("failure_point", ["client", "reservation", "create"])
+async def test_post_commit_dispatch_cancellation_preserves_record(
+    harness: "Callable[..., Any]", monkeypatch: "pytest.MonkeyPatch", failure_point: "str"
+) -> "None":
+    """Cancellation keeps its control-flow meaning after persistence."""
+    live = await harness()
+
+    async def cancel(*_args: "Any", **_kwargs: "Any") -> "Any":
+        raise asyncio.CancelledError
+
+    if failure_point == "create":
+        live.client.on_create = cancel
+    else:
+        method = "_get_client" if failure_point == "client" else "_reserve_delivery_name"
+        monkeypatch.setattr(type(live.service.get_execution_backend()), method, cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await live.service.enqueue(unique_probe)
+    record = await live.service.get_queue_backend().get_task_by_key(UNIQUE_KEY)
+    assert record is not None and record.status == "pending"
+    assert (await live.service.get_queue_backend().get_statistics()).total == 1
+
+
+async def test_post_commit_result_read_preserves_identity(
+    harness: "Callable[..., Any]", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
+    """Losing the final reload does not invite enqueueing an already delivered job again."""
+    live = await harness()
+    storage_type = type(live.service.get_queue_backend())
+    original_get_task = storage_type.get_task
+
+    async def fail_after_delivery(self: "Any", task_id: "UUID") -> "Any":
+        if live.client.create_calls:
+            msg = "result read unavailable"
+            raise RuntimeError(msg)
+        return await original_get_task(self, task_id)
+
+    monkeypatch.setattr(storage_type, "get_task", fail_after_delivery)
+    with pytest.raises(QueueDispatchError) as excinfo:
+        await live.service.enqueue(probe)
+    assert excinfo.value.committed is True
+    assert excinfo.value.task_id is not None
+    assert len(live.client.create_calls) == 1
+    assert decode_json(live.client.create_calls[0].body)["task_id"] == str(excinfo.value.task_id)
+    monkeypatch.setattr(storage_type, "get_task", original_get_task)
+    assert await live.reader.get_task(excinfo.value.task_id) is not None
+
+
+@pytest.mark.parametrize("failure_point", ["status", "end_span", "report", "cancel"])
+async def test_fallback_logging_preserves_committed_dispatch_failure(
+    harness: "Callable[..., Any]", monkeypatch: "pytest.MonkeyPatch", failure_point: "str"
+) -> "None":
+    from litestar_queues.execution.cloudtasks import backend as backend_module
+
+    class RaisingHandler(logging.Handler):
+        def emit(self, record: "logging.LogRecord") -> "None":
+            msg = "diagnostic log unavailable"
+            raise OSError(msg)
+
+    live = await harness()
+    record = await live.service.get_queue_backend().enqueue(
+        TASK_NAME, execution_backend="cloudtasks", metadata={"timeout": 1740}
+    )
+    backend = live.service.get_execution_backend()
+    runtime_type = type(live.service.observability_runtime)
+    span = object()
+    monkeypatch.setattr(runtime_type, "start_span", lambda *_args, **_kwargs: span)
+    monkeypatch.setattr(runtime_type, "set_status_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime_type, "end_span", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend_module.logger, "handlers", [RaisingHandler()])
+    monkeypatch.setattr(backend_module.logger, "propagate", False)
+    monkeypatch.setattr(backend_module.logger, "level", logging.WARNING)
+
+    def fail_diagnostic(*_args: "Any", **_kwargs: "Any") -> "None":
+        msg = "telemetry unavailable"
+        raise RuntimeError(msg)
+
+    async def fail_publication(*_args: "Any", **_kwargs: "Any") -> "None":
+        fail_diagnostic()
+
+    primary: BaseException
+    if failure_point == "cancel":
+        primary = asyncio.CancelledError("dispatch cancelled")
+    elif failure_point == "report":
+        primary = ServiceUnavailable("provider unavailable")
+    else:
+        primary = QueueDispatchError("dispatch failed", task_id=record.id, committed=True)
+
+    async def fail_dispatch(*_args: "Any", **_kwargs: "Any") -> "None":
+        raise primary
+
+    if failure_point == "report":
+        live.client.on_create = fail_dispatch
+        monkeypatch.setattr(type(backend), "_publish_delivery_failure", fail_publication)
+    else:
+        monkeypatch.setattr(type(backend), "_schedule_delivery", fail_dispatch)
+        method = "set_status_error" if failure_point == "status" else "end_span"
+        monkeypatch.setattr(runtime_type, method, fail_diagnostic)
+
+    expected = asyncio.CancelledError if failure_point == "cancel" else QueueDispatchError
+    with pytest.raises(expected) as excinfo:
+        await backend.schedule(live.service, record)
+    if failure_point == "report":
+        assert excinfo.value.__cause__ is primary
+    else:
+        assert excinfo.value is primary
+    if isinstance(excinfo.value, QueueDispatchError):
+        assert excinfo.value.task_id == record.id
+        assert excinfo.value.committed is True
+    assert await live.reader.get_task(record.id) is not None
 
 
 # --------------------------------------------------------------------------- records never delivered

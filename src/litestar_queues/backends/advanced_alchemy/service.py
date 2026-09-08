@@ -1,5 +1,6 @@
 """Advanced Alchemy queue persistence service."""
 
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
@@ -8,8 +9,10 @@ from advanced_alchemy.operations import OnConflictUpsert
 from advanced_alchemy.service import SQLAlchemyAsyncRepositoryService
 from advanced_alchemy.utils.serialization import decode_json as _decode_json
 from advanced_alchemy.utils.serialization import encode_json as _encode_json
-from sqlalchemy import and_, case, delete, desc, func, literal, or_, select, update
+from sqlalchemy import and_, case, delete, desc, func, literal, or_, select, text, update
+from sqlalchemy import cast as sql_cast
 from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy.dialects import mysql, oracle
 from sqlalchemy.orm.exc import UnmappedColumnError
 
 from litestar_queues.backends.advanced_alchemy.repository import (
@@ -21,6 +24,7 @@ from litestar_queues.backends.base import (
     EXTERNAL_DISPATCH_RESERVATION_PREFIX,
     STALE_HEARTBEAT_ERROR,
     STALE_REQUEUE_PRIORITY,
+    DispatchRepairCandidates,
     attempts_consumed,
     interruption_count,
     record_matches_filters,
@@ -30,6 +34,7 @@ from litestar_queues.backends.base import (
 )
 from litestar_queues.events import QueueEventLogRecord
 from litestar_queues.events._log_records import optional_float
+from litestar_queues.exceptions import QueueConfigurationError
 from litestar_queues.models import (
     HeartbeatTouchResult,
     QueuedTaskRecord,
@@ -58,6 +63,7 @@ _SKIP_LOCKED_CLAIM_DIALECTS = frozenset({"oracle", "postgresql"})
 _NATIVE_KEYED_ENQUEUE_DIALECTS = frozenset({"mariadb", "mysql", "oracle", "postgresql"})
 _ORACLE_CLAIM_CANDIDATE_LIMIT = 10
 _CAS_CLAIM_BATCH_SIZE = 10
+_MICROSECOND_PRECISION = 6
 
 
 class QueueEventLogService(SQLAlchemyAsyncRepositoryService[Any]):
@@ -73,8 +79,81 @@ class QueueEventLogService(SQLAlchemyAsyncRepositoryService[Any]):
         )
 
     async def add_records(self, records: "Sequence[QueueEventLogRecord]") -> "None":
-        """Persist event-history records."""
-        self.repository.session.add_all([self.model_from_record(record) for record in records])
+        """Add missing immutable events within the caller-owned transaction."""
+        incoming: dict[str, QueueEventLogRecord] = {}
+        for record in records:
+            canonical = self.record_from_model(self.model_from_record(record))
+            previous = incoming.get(record.event_id)
+            if previous is not None:
+                normalized = await self._comparison_records((previous, canonical))
+                _require_identical_history(*normalized)
+            else:
+                incoming[record.event_id] = canonical
+        missing = dict(incoming)
+        event_ids = tuple(incoming)
+        for start in range(0, len(event_ids), 500):
+            statement = select(self.model_type).where(self.model_type.event_id.in_(event_ids[start : start + 500]))
+            models = (await self.repository.session.execute(statement)).scalars().all()
+            stored = [self.record_from_model(model) for model in models]
+            compared = await self._comparison_records([incoming[record.event_id] for record in stored])
+            for original, candidate in zip(stored, compared, strict=True):
+                _require_identical_history(original, candidate)
+                missing.pop(original.event_id)
+        self.repository.session.add_all([self.model_from_record(record) for record in missing.values()])
+
+    async def _comparison_records(self, records: "Sequence[QueueEventLogRecord]") -> "list[QueueEventLogRecord]":
+        session = self.repository.session
+        dialect = session.get_bind().dialect
+        if not records:
+            return list(records)
+        comparison_type = self._comparison_timestamp_type()
+        # Match actual timestamp and numeric storage precision only for replay
+        # comparisons. 100 records cap the projection at 500 bound scalars.
+        normalized: list[QueueEventLogRecord] = []
+        for start in range(0, len(records), 100):
+            batch = records[start : start + 100]
+            projections: list[Any] = []
+            projected_fields: list[tuple[int, str]] = []
+            changes: list[dict[str, Any]] = [{} for _ in batch]
+            for index, record in enumerate(batch):
+                if comparison_type is not None:
+                    projections.append(sql_cast(literal(record.occurred_at), comparison_type))
+                    projected_fields.append((index, "occurred_at"))
+                for name in ("progress_current", "progress_total", "progress_percent", "duration_ms"):
+                    value = getattr(record, name)
+                    if value is not None:
+                        type_name = getattr(self.model_type, name).type.compile(dialect=dialect)
+                        parameter = f"history_{index}_{name}"
+                        # SQLAlchemy's MySQL compiler skips CAST(Float). The
+                        # native CAST preserves the same returned FLOAT codec.
+                        projections.append(text(f"CAST(:{parameter} AS {type_name})").bindparams(**{parameter: value}))
+                        projected_fields.append((index, name))
+                if dialect.name == "oracle":
+                    changes[index].update({
+                        field.name: None for field in fields(record) if getattr(record, field.name) == ""
+                    })
+            if projections:
+                row = (await session.execute(select(*projections))).one()
+                for (index, name), value in zip(projected_fields, row, strict=True):
+                    changes[index][name] = _coerce_datetime(value) if name == "occurred_at" else optional_float(value)
+            normalized.extend(replace(record, **values) for record, values in zip(batch, changes, strict=True))
+        return normalized
+
+    def _comparison_timestamp_type(self) -> "Any":
+        dialect = self.repository.session.get_bind().dialect
+        mapped_type = self.model_type.occurred_at.type
+        column_type = mapped_type.dialect_impl(dialect)
+        if dialect.name == "postgresql":
+            # Async driver adaptations can discard TIMESTAMP.precision;
+            # compile the actual mapped type, including with_variant choices.
+            declaration = mapped_type.compile(dialect=dialect)
+            if "(" in declaration and f"({_MICROSECOND_PRECISION})" not in declaration:
+                return mapped_type
+        elif dialect.name in {"mysql", "mariadb"}:
+            return mysql.DATETIME(fsp=getattr(column_type, "fsp", None) or 0)
+        elif dialect.name == "oracle":
+            return oracle.DATE() if isinstance(column_type, oracle.DATE) else mapped_type
+        return None
 
     def _criteria(self, query: "QueueEventQuery") -> "list[Any]":
         model = self.model_type
@@ -193,6 +272,7 @@ class QueueEventLogService(SQLAlchemyAsyncRepositoryService[Any]):
                 )
             )
 
+        summaries.sort(key=lambda summary: (summary.stage is not None, summary.stage or ""))
         return summaries
 
     async def cleanup_events(
@@ -221,7 +301,7 @@ class QueueEventLogService(SQLAlchemyAsyncRepositoryService[Any]):
             for ex in exclude:
                 ex_criteria = self._criteria(ex)
                 if ex_criteria:
-                    criteria.append(~and_(*ex_criteria))
+                    criteria.append(case((and_(*ex_criteria), 1), else_=0) == 0)
 
         if limit is not None:
             bounded_query = (
@@ -1235,6 +1315,102 @@ class QueueTaskService(SQLAlchemyAsyncRepositoryService[Any]):
         model = await self._select_task(task_id)
         return self.record_from_model(model) if model is not None else None
 
+    async def list_dispatch_repair_candidates(
+        self, execution_backend: "str", *, limit: "int"
+    ) -> "DispatchRepairCandidates":
+        """Mark a bounded selection while preserving progress from newer scans.
+
+        Raises:
+            QueueConfigurationError: If the limit is negative.
+        """
+        if limit < 0:
+            message = "Dispatch repair limit must be non-negative."
+            raise QueueConfigurationError(message)
+        if limit == 0:
+            return DispatchRepairCandidates()
+        now = _utc_now()
+        model_type = self.model_type
+        criteria = (
+            model_type.execution_backend == execution_backend,
+            model_type.status.in_(_DUE_STATUSES),
+            or_(model_type.expires_at.is_(None), model_type.expires_at > now),
+        )
+        selected = await self.repository.session.execute(
+            select(model_type.id)
+            .where(*criteria)
+            .order_by(func.coalesce(model_type.dispatch_checked_at, model_type.created_at), model_type.id)
+            .limit(limit)
+        )
+        task_ids = list(selected.scalars().all())
+        if not task_ids:
+            return DispatchRepairCandidates()
+        # A bare datetime CASE result binds as Oracle DATE and loses fractions.
+        checked_now = literal(now, type_=model_type.dispatch_checked_at.type)
+        checked_at = case(
+            (or_(model_type.dispatch_checked_at.is_(None), model_type.dispatch_checked_at < checked_now), checked_now),
+            else_=model_type.dispatch_checked_at,
+        )
+        await self.repository.session.execute(
+            update(model_type)
+            .where(model_type.id.in_(task_ids), *criteria)
+            .values(_update_values(model_type, {"dispatch_checked_at": checked_at}, now=now))
+            .execution_options(synchronize_session=False)
+        )
+        # A current read also discards transitions committed after the initial
+        # selection on databases whose ordinary reads retain an older snapshot.
+        models = (
+            (
+                await self.repository.session.execute(
+                    select(model_type)
+                    .where(model_type.id.in_(task_ids), *criteria)
+                    .order_by(model_type.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {model.id: self.record_from_model(model) for model in models}
+        return DispatchRepairCandidates(
+            tuple(by_id[task_id] for task_id in task_ids if task_id in by_id), len(task_ids), len(task_ids) == limit
+        )
+
+    async def reserve_scheduled_execution_ref(
+        self,
+        task_id: "UUID",
+        execution_backend: "str",
+        execution_ref: "str",
+        *,
+        expected_retry_count: "int",
+        expected_execution_ref: "str | None",
+    ) -> "QueuedTaskRecord | None":
+        """Fence reference creation against the exact active scheduled attempt."""
+        now = _utc_now()
+        model_type = self.model_type
+        reference_matches = (
+            model_type.execution_ref.is_(None)
+            if expected_execution_ref is None
+            else model_type.execution_ref == expected_execution_ref
+        )
+        result = await self.repository.session.execute(
+            update(model_type)
+            .where(
+                model_type.id == task_id,
+                model_type.execution_backend == execution_backend,
+                model_type.retry_count == expected_retry_count,
+                reference_matches,
+                model_type.status.in_(_DUE_STATUSES),
+                or_(model_type.expires_at.is_(None), model_type.expires_at > now),
+            )
+            .values(_update_values(model_type, {"execution_ref": execution_ref}, now=now))
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            return None
+        model = await self._select_task(task_id)
+        return self.record_from_model(model) if model is not None else None
+
     async def reserve_external_dispatch(
         self,
         task_id: "UUID",
@@ -1485,6 +1661,7 @@ class QueueTaskService(SQLAlchemyAsyncRepositoryService[Any]):
             started_at=record.started_at,
             completed_at=record.completed_at,
             heartbeat_at=record.heartbeat_at,
+            dispatch_checked_at=record.dispatch_checked_at,
             result_json=_serialize_json(record.result),
             error=record.error,
             task_key=record.key,
@@ -1522,6 +1699,7 @@ class QueueTaskService(SQLAlchemyAsyncRepositoryService[Any]):
             started_at=_coerce_datetime(model.started_at),
             completed_at=_coerce_datetime(model.completed_at),
             heartbeat_at=_coerce_datetime(model.heartbeat_at),
+            dispatch_checked_at=_coerce_datetime(model.dispatch_checked_at),
             result=_deserialize_json(model.result_json),
             error=model.error,
             key=model.task_key,
@@ -1686,6 +1864,17 @@ def _model_insert_values(model: "Any", model_type: "type[Any]") -> "dict[str, An
             continue
         values[column.name] = value
     return values
+
+
+def _require_identical_history(stored: "QueueEventLogRecord", incoming: "QueueEventLogRecord") -> "None":
+    conflicts = [
+        field.name
+        for field in fields(stored)
+        if field.name != "created_at" and getattr(stored, field.name) != getattr(incoming, field.name)
+    ]
+    if conflicts:
+        message = f"Conflicting immutable queue event history record for event ID {incoming.event_id!r}: {', '.join(conflicts)}."
+        raise QueueConfigurationError(message)
 
 
 def _utc_now() -> "datetime":

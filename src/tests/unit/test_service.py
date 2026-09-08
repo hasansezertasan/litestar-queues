@@ -18,7 +18,7 @@ from litestar_queues.execution.base import ExecutionCancelResult
 from litestar_queues.execution.cloudrun import CloudRunExecutionConfig
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
     from uuid import UUID
 
     from litestar_queues import Task, TaskDependencyProvider, TaskExecutionContext
@@ -100,6 +100,16 @@ class _LifecycleEventLog:
         if self._flush_error is not None:
             raise self._flush_error
 
+    async def publish_event_after_commit(
+        self, event: "QueueEvent", *, release: "Callable[[], Awaitable[None]]", barrier: bool = False
+    ) -> None:
+        await release()
+
+    async def aclose(self) -> None:
+        self._lifecycle_order.append("event_log.close")
+        if self._flush_error is not None:
+            raise self._flush_error
+
 
 class _LifecycleSink:
     def __init__(
@@ -173,7 +183,76 @@ async def test_service_rolls_back_every_resource_when_execution_open_fails() -> 
         await service.open()
 
     await service.close()
-    assert order == ["queue.open", "execution.open", "execution.close", "event_log.flush", "queue.close"]
+    assert order == ["queue.open", "execution.open", "execution.close", "event_log.close", "queue.close"]
+
+
+async def test_service_closes_owned_history_and_detaches_reference() -> None:
+    order: list[str] = []
+    event_log = _LifecycleEventLog(order)
+    service = QueueService(
+        QueueConfig(worker=WorkerConfig(placement="external"), events=QueueEventsConfig(history=EventHistoryConfig())),
+        queue_backend=_LifecycleQueueBackend(order, event_log),
+        execution_backend=_LifecycleExecutionBackend(order),
+    )
+    await service.open()
+    await service.close()
+    assert "event_log.close" in order
+    assert "event_log.flush" not in order
+    assert service.get_event_log() is None
+
+
+async def test_service_configuration_failure_closes_acquired_history(monkeypatch: "pytest.MonkeyPatch") -> None:
+    order: list[str] = []
+    event_log = _LifecycleEventLog(order)
+    publisher = QueueEventPublisher(_LifecycleSink(order))
+    error = RuntimeError("history configuration failed")
+
+    def reject(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(QueueEventPublisher, "set_event_log", reject)
+    service = QueueService(
+        QueueConfig(worker=WorkerConfig(placement="external"), events=QueueEventsConfig(history=EventHistoryConfig())),
+        queue_backend=_LifecycleQueueBackend(order, event_log),
+        event_publisher=publisher,
+    )
+    with pytest.raises(RuntimeError) as caught:
+        await service.open()
+    assert caught.value is error
+    assert order == ["queue.open", "event_log.close", "queue.close"]
+    assert service.get_event_log() is None
+
+
+async def test_service_concurrent_close_waits_for_history_cleanup() -> None:
+    order: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingLog(_LifecycleEventLog):
+        async def aclose(self) -> None:
+            entered.set()
+            await release.wait()
+            await super().aclose()
+
+    service = QueueService(
+        QueueConfig(worker=WorkerConfig(placement="external"), events=QueueEventsConfig(history=EventHistoryConfig())),
+        queue_backend=_LifecycleQueueBackend(order, BlockingLog(order)),
+        execution_backend=_LifecycleExecutionBackend(order),
+    )
+    await service.open()
+    first = asyncio.create_task(service.close())
+    second: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        second = asyncio.create_task(service.close())
+        await asyncio.sleep(0)
+        assert not second.done()
+    finally:
+        release.set()
+        await first
+        if second is not None:
+            await second
+    assert order.count("event_log.close") == 1
 
 
 async def test_service_rolls_back_every_resource_when_sink_open_fails() -> "None":
@@ -198,10 +277,10 @@ async def test_service_rolls_back_every_resource_when_sink_open_fails() -> "None
         "queue.open",
         "execution.open",
         "sink.open",
-        "sink.close",
         "execution.close",
-        "event_log.flush",
+        "event_log.close",
         "queue.close",
+        "sink.close",
     ]
 
 
@@ -224,7 +303,7 @@ async def test_service_rollback_preserves_primary_failure_and_attempts_every_clo
         await service.open()
 
     await service.close()
-    assert order == ["queue.open", "execution.open", "execution.close", "event_log.flush", "queue.close"]
+    assert order == ["queue.open", "execution.open", "execution.close", "event_log.close", "queue.close"]
 
 
 async def test_service_open_and_close_are_idempotent() -> "None":
@@ -253,7 +332,7 @@ async def test_service_open_and_close_are_idempotent() -> "None":
         "sink.open",
         "buffer.start",
         "execution.close",
-        "event_log.flush",
+        "event_log.close",
         "buffer.stop",
         "queue.close",
         "sink.close",
@@ -291,7 +370,7 @@ async def test_service_close_attempts_every_resource_and_raises_first_error(
 
     assert order[-6:] == [
         "execution.close",
-        "event_log.flush",
+        "event_log.close",
         "buffer.stop",
         "queue.close",
         "sink.close",
@@ -327,7 +406,7 @@ async def test_service_close_control_flow_takes_precedence_and_all_resources_clo
 
     assert order[-6:] == [
         "execution.close",
-        "event_log.flush",
+        "event_log.close",
         "buffer.stop",
         "queue.close",
         "sink.close",
@@ -400,7 +479,7 @@ async def test_provider_opens_first_and_closes_last() -> "None":
         "sink.open",
         "buffer.start",
         "execution.close",
-        "event_log.flush",
+        "event_log.close",
         "buffer.stop",
         "queue.close",
         "sink.close",
@@ -432,7 +511,7 @@ async def test_provider_is_rolled_back_when_a_later_resource_fails_to_open() -> 
         "queue.open",
         "execution.open",
         "execution.close",
-        "event_log.flush",
+        "event_log.close",
         "queue.close",
         "provider.close",
     ]
@@ -462,7 +541,7 @@ async def test_provider_close_error_does_not_hide_the_primary_failure() -> "None
         "queue.open",
         "execution.open",
         "execution.close",
-        "event_log.flush",
+        "event_log.close",
         "queue.close",
         "provider.close",
     ]
@@ -1829,6 +1908,16 @@ class _RecordingEventLog:
     async def flush_events(self) -> "None":
         self.flushed = True
 
+    async def publish_event_after_commit(
+        self, event: "QueueEvent", *, release: "Callable[[], Awaitable[None]]", barrier: "bool" = False
+    ) -> "None":
+        del barrier
+        await self.publish_event(event)
+        await release()
+
+    async def aclose(self) -> "None":
+        await self.flush_events()
+
     async def query_events(
         self, query: "QueueEventQuery | None" = None, *, extra: "Mapping[str, str] | None" = None
     ) -> "OffsetPagination[QueueEventLogRecord]":
@@ -2431,3 +2520,90 @@ async def test_cancel_metric_labels_are_identical_across_result_statuses() -> "N
     counters = [c for c in obs.counters if c[0] == "litestar_queues.execution.cancel"]
     assert len(counters) == 2
     assert set(counters[0][2].keys()) == set(counters[1][2].keys())
+
+
+@pytest.mark.parametrize("cron", [False, True])
+@pytest.mark.parametrize("retries", [0, 2])
+async def test_schedule_initial_retry_budget_matches_manual_enqueue(cron: bool, retries: int) -> None:
+    from litestar_queues import task
+    from litestar_queues.task import clear_task_registry
+
+    clear_task_registry()
+
+    @task("schedule.budget", cron="* * * * *" if cron else None, interval=None if cron else 60, retries=retries)
+    async def probe() -> None:
+        return None
+
+    async with QueueService(QueueConfig(worker=WorkerConfig(placement="external"), queue_backend="memory")) as service:
+        first = (await service.initialize_schedules())[0]
+        manual = await service.enqueue(probe)
+        manual_record = await service.get_task(manual.id)
+        assert manual_record is not None
+        assert first.max_retries == manual_record.max_retries == retries
+        assert (await service.initialize_schedules())[0].id == first.id
+
+
+@pytest.mark.parametrize(
+    "budget,state,consumed,cron",
+    [
+        (0, "pending", False, False),
+        (0, "scheduled", False, True),
+        (0, "running", False, False),
+        (2, "pending", True, True),
+        (2, "scheduled", True, False),
+        (2, "running", True, True),
+    ],
+)
+async def test_schedule_restart_preserves_persisted_retry_policy(
+    budget: int, state: str, consumed: bool, cron: bool
+) -> None:
+    from copy import deepcopy
+
+    from litestar_queues import task
+    from litestar_queues.task import clear_task_registry, get_scheduled_tasks
+
+    clear_task_registry()
+
+    @task(
+        "schedule.restart",
+        cron="* * * * *" if cron else None,
+        interval=None if cron else 60,
+        retries=4,
+        retry_backoff=99,
+    )
+    async def probe() -> None:
+        return None
+
+    config = QueueConfig(worker=WorkerConfig(placement="external"), queue_backend="memory")
+    backend = InMemoryQueueBackend()
+    async with QueueService(config, queue_backend=backend):
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        record = await backend.enqueue(
+            probe.name,
+            key=f"scheduled:{probe.name}",
+            max_retries=budget,
+            scheduled_at=future if state == "scheduled" and not consumed else None,
+            metadata={
+                "schedule": get_scheduled_tasks()[probe.name].as_metadata(),
+                "retry_backoff": {"initial_delay": 7.0, "multiplier": 1.0, "max_delay": None},
+            },
+        )
+        if consumed:
+            assert await backend.claim_task(record.id) is not None
+            assert (
+                await backend.fail_task(
+                    record.id, "previous failure", retry_at=future if state == "scheduled" else None
+                )
+                is not None
+            )
+        if state == "running":
+            assert await backend.claim_task(record.id) is not None
+        snapshot = deepcopy(record)
+    async with QueueService(config, queue_backend=backend) as restarted:
+        for _ in range(2):
+            reused = (await restarted.initialize_schedules())[0]
+            assert reused == snapshot
+            assert reused.status == state
+            assert reused.max_retries == budget
+            assert reused.retry_count == int(consumed)
+        assert (await backend.get_statistics()).total == 1

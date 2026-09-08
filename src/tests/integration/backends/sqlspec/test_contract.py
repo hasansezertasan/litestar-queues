@@ -2131,7 +2131,7 @@ async def test_sqlspec_backend_can_start_with_packaged_migrations(
     assert versions == ["ext_litestar_queues_0001"]
 
 
-async def test_sqlspec_backend_packaged_migrations_do_not_mutate_adopter_config(
+async def test_sqlspec_backend_packaged_migrations_publish_extension_without_changing_migration_options(
     tmp_path: "Path", sqlite_config_factory: "SqliteConfigFactory", caplog: "pytest.LogCaptureFixture"
 ) -> "None":
     db_path = tmp_path / "migrated-config.db"
@@ -2152,7 +2152,10 @@ async def test_sqlspec_backend_packaged_migrations_do_not_mutate_adopter_config(
 
     assert record.task_name == "tasks.migrated_config"
     assert not any("Extension litestar_queues not found" in entry.message for entry in caplog.records)
-    assert deepcopy(sqlspec_config.extension_config) == original_extension_config
+    configured = deepcopy(sqlspec_config.extension_config)
+    queue_settings = cast("dict[str, Any]", configured.pop(QUEUE_EXTENSION_NAME))
+    assert queue_settings["queue_table_name"] == "queue_task"
+    assert configured == original_extension_config
     assert deepcopy(sqlspec_config.migration_config) == original_migration_config
 
 
@@ -2347,3 +2350,250 @@ class _FakeSyncDriver:
 
     def rollback(self) -> "None":
         self.rollback_count += 1
+
+
+async def test_sqlspec_dispatch_repair_candidates(sqlspec_backend: "SQLSpecQueueBackend") -> "None":
+    from tests.integration.backends._dispatch_repair_asserts import assert_dispatch_repair_candidates
+
+    await assert_dispatch_repair_candidates(sqlspec_backend)
+
+
+async def test_sqlspec_scheduled_execution_ref(sqlspec_backend: "SQLSpecQueueBackend") -> "None":
+    from tests.integration.backends._dispatch_repair_asserts import (
+        assert_scheduled_execution_ref_contenders,
+        assert_scheduled_execution_ref_rejects_mismatches,
+    )
+
+    await assert_scheduled_execution_ref_contenders(sqlspec_backend)
+    await assert_scheduled_execution_ref_rejects_mismatches(sqlspec_backend)
+
+
+async def test_sqlspec_registry_dispatch_repair(
+    queue_backend: "BaseQueueBackend", queue_backend_case: "BackendCase", tmp_path: "Path"
+) -> "None":
+    if not isinstance(queue_backend, SQLSpecQueueBackend):
+        pytest.skip("SQLSpec implementation contract")
+    from tests.integration.backends._dispatch_repair_asserts import (
+        assert_dispatch_repair_candidates,
+        assert_scheduled_execution_ref_contenders,
+        assert_scheduled_execution_ref_rejects_mismatches,
+    )
+
+    await assert_dispatch_repair_candidates(queue_backend)
+    if queue_backend_case.name == "adbc-sqlite":
+        from sqlspec.adapters.adbc import AdbcConfig
+
+        await assert_scheduled_execution_ref_contenders(queue_backend)
+
+        other = SQLSpecQueueBackend(
+            backend_config=SQLSpecBackendConfig(
+                sqlspec_config=AdbcConfig(
+                    connection_config={
+                        "driver_name": "adbc_driver_sqlite",
+                        "uri": str(tmp_path / "queue-adbc-sqlite.db"),
+                    }
+                ),
+                queue_table_name=queue_backend._queue_table_name,
+            )
+        )
+        await other.open()
+        try:
+            await assert_scheduled_execution_ref_contenders(queue_backend, other)
+        finally:
+            await other.close()
+    else:
+        await assert_scheduled_execution_ref_contenders(queue_backend)
+    await assert_scheduled_execution_ref_rejects_mismatches(queue_backend)
+
+
+async def test_sqlspec_dispatch_repair_progress_survives_reopen(tmp_path: "Path") -> "None":
+    path = tmp_path / "repair.db"
+
+    def build() -> "SQLSpecQueueBackend":
+        return SQLSpecQueueBackend(
+            backend_config=SQLSpecBackendConfig(
+                sqlspec_config=AiosqliteConfig(connection_config={"database": str(path)})
+            )
+        )
+
+    first = build()
+    await first.open()
+    try:
+        await first.create_schema()
+        one = await first.enqueue("one", execution_backend="cloudtasks")
+        two = await first.enqueue("two", execution_backend="cloudtasks")
+        selected = await first.list_dispatch_repair_candidates("cloudtasks", limit=1)
+        assert selected.records[0].id == one.id
+    finally:
+        await first.close()
+    second = build()
+    await second.open()
+    try:
+        selected = await second.list_dispatch_repair_candidates("cloudtasks", limit=1)
+        assert selected.records[0].id == two.id
+    finally:
+        await second.close()
+
+
+async def test_sqlspec_dispatch_repair_preserves_newer_marks(sqlspec_backend: "SQLSpecQueueBackend") -> "None":
+    record = await sqlspec_backend.enqueue("checked", execution_backend="cloudtasks")
+    newer = datetime.now(timezone.utc) + timedelta(minutes=1)
+    older = newer - timedelta(seconds=1)
+    store = sqlspec_backend._get_store()
+    async with sqlspec_backend._session() as driver:
+        await driver.begin()
+        for stamp in (newer, older, newer):
+            await driver.execute(
+                store.mark_dispatch_checked(
+                    task_id=str(record.id),
+                    execution_backend="cloudtasks",
+                    now=sqlspec_backend._serialize_datetime(stamp),
+                )
+            )
+        await driver.commit()
+    page = await sqlspec_backend.list_dispatch_repair_candidates("cloudtasks", limit=1)
+    assert page.examined == 1 and page.records[0].dispatch_checked_at == newer
+
+
+async def test_sqlspec_duckdb_independent_scheduled_execution_ref(tmp_path: "Path") -> "None":
+    from sqlspec.adapters.duckdb import DuckDBConfig
+
+    from tests.integration.backends._dispatch_repair_asserts import assert_scheduled_execution_ref_contenders
+
+    def build() -> "SQLSpecQueueBackend":
+        return SQLSpecQueueBackend(
+            backend_config=SQLSpecBackendConfig(
+                sqlspec_config=DuckDBConfig(connection_config={"database": str(tmp_path / "competing.duckdb")})
+            )
+        )
+
+    first, second = build(), build()
+    await first.open()
+    await second.open()
+    try:
+        await first.create_schema()
+        await assert_scheduled_execution_ref_contenders(first, second)
+    finally:
+        await second.close()
+        await first.close()
+
+
+@pytest.mark.parametrize("commit_contender", [True, False], ids=["commit", "rollback"])
+@pytest.mark.parametrize("clear_cause", [True, False], ids=["mapped", "chained"])
+async def test_sqlspec_duckdb_scheduled_execution_ref_open_contender(
+    duckdb_backend: "SQLSpecQueueBackend",
+    tmp_path: "Path",
+    monkeypatch: "pytest.MonkeyPatch",
+    commit_contender: "bool",
+    clear_cause: "bool",
+) -> "None":
+    """Verify contender handling when competing write is uncommitted or native cause is cleared."""
+    from sqlspec.adapters.duckdb import DuckDBConfig
+    from sqlspec.exceptions import SQLSpecError
+
+    if clear_cause:
+        reserve_once = SQLSpecQueueBackend._reserve_scheduled_execution_ref_once
+
+        async def without_native_cause(
+            self: "SQLSpecQueueBackend", *args: "Any", **kwargs: "Any"
+        ) -> "QueuedTaskRecord | None":
+            try:
+                return await reserve_once(self, *args, **kwargs)
+            except SQLSpecError as exc:
+                raise exc from None
+
+        monkeypatch.setattr(SQLSpecQueueBackend, "_reserve_scheduled_execution_ref_once", without_native_cause)
+
+    second = SQLSpecQueueBackend(
+        backend_config=SQLSpecBackendConfig(
+            sqlspec_config=DuckDBConfig(connection_config={"database": str(tmp_path / "queue.duckdb")})
+        )
+    )
+    await second.open()
+    try:
+        record = await duckdb_backend.enqueue("held-reservation", execution_backend="cloudtasks")
+        async with duckdb_backend._session() as driver:
+            await driver.begin()
+            await driver.execute(
+                duckdb_backend._get_store().reserve_scheduled_execution_ref(
+                    task_id=str(record.id),
+                    execution_backend="cloudtasks",
+                    execution_ref="contender",
+                    expected_retry_count=0,
+                    expected_execution_ref=None,
+                    now=datetime.now(timezone.utc),
+                )
+            )
+            assert (
+                await second.reserve_scheduled_execution_ref(
+                    record.id, "cloudtasks", "loser", expected_retry_count=0, expected_execution_ref=None
+                )
+                is None
+            )
+            if commit_contender:
+                await driver.commit()
+            else:
+                await driver.rollback()
+
+        stored = await second.get_task(record.id)
+        assert stored is not None
+        assert stored.execution_ref == ("contender" if commit_contender else None)
+        replacement = await second.reserve_scheduled_execution_ref(
+            record.id, "cloudtasks", "replacement", expected_retry_count=0, expected_execution_ref=stored.execution_ref
+        )
+        assert replacement is not None
+        assert replacement.execution_ref == "replacement"
+    finally:
+        await second.close()
+
+
+@pytest.mark.parametrize("failure_kind", ["native", "mapped", "untyped"])
+async def test_sqlspec_duckdb_dispatch_nonconflict_is_not_retried(
+    duckdb_backend: "SQLSpecQueueBackend", monkeypatch: "pytest.MonkeyPatch", failure_kind: "str"
+) -> "None":
+    from duckdb import TransactionException
+    from sqlspec.exceptions import SQLSpecError
+
+    calls = 0
+    error = (
+        RuntimeError("DuckDB database error: TransactionContext Error: Conflict on update!")
+        if failure_kind == "untyped"
+        else SQLSpecError("transaction failed")
+    )
+    if failure_kind == "native":
+        error.__cause__ = TransactionException("cannot start a transaction within a transaction")
+
+    async def broken_transaction(*args: "Any", **kwargs: "Any") -> "None":
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr(SQLSpecQueueBackend, "_reserve_scheduled_execution_ref_once", broken_transaction)
+    with pytest.raises(type(error)) as caught:
+        await duckdb_backend.reserve_scheduled_execution_ref(
+            uuid4(), "cloudtasks", "new", expected_retry_count=0, expected_execution_ref=None
+        )
+    assert caught.value is error
+    assert calls == 1
+
+
+async def test_sqlspec_registry_dispatch_mark_preserves_fractional_newer_time(
+    queue_backend: "BaseQueueBackend", queue_backend_case: "BackendCase"
+) -> "None":
+    if queue_backend_case.name != "oracle-oracledb":
+        pytest.skip("Oracle timestamp binding regression")
+    assert isinstance(queue_backend, SQLSpecQueueBackend)
+    record = await queue_backend.enqueue("fractional-check", execution_backend="cloudtasks")
+    newer = (datetime.now(timezone.utc) + timedelta(minutes=1)).replace(microsecond=654321)
+    older = newer.replace(microsecond=123456)
+    store = queue_backend._get_store()
+    async with queue_backend._session() as driver:
+        await driver.begin()
+        for stamp in (newer, older, newer):
+            await driver.execute(
+                store.mark_dispatch_checked(task_id=str(record.id), execution_backend="cloudtasks", now=stamp)
+            )
+        await driver.commit()
+    persisted = await queue_backend.get_task(record.id)
+    assert persisted is not None
+    assert persisted.dispatch_checked_at == newer

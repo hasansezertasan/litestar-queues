@@ -22,13 +22,20 @@ from litestar_queues._correlation import (
 from litestar_queues._identity import IDENTITY_VERSION, arguments_identity, task_identity
 from litestar_queues.backends.base import EXTERNAL_DISPATCH_RESERVATION_PREFIX, interruption_count
 from litestar_queues.config import execution_backend_name, queue_backend_name
+from litestar_queues.events._history_buffer import _in_event_release_callback
 from litestar_queues.events.context import TaskExecutionContext, bind_task_context
 from litestar_queues.events.models import QueueEvent, QueueEventActor
 from litestar_queues.events.producer import QueueEventProducer
 from litestar_queues.events.sinks import _call_optional_lifecycle, _select_lifecycle_error
-from litestar_queues.exceptions import JobCancelledError, NonRetryableError, QueueConfigurationError
+from litestar_queues.exceptions import (
+    JobCancelledError,
+    NonRetryableError,
+    QueueConfigurationError,
+    QueueDispatchError,
+    QueueDispatchRepairError,
+)
 from litestar_queues.execution import get_execution_backend
-from litestar_queues.execution.base import ExecutionCancelResult
+from litestar_queues.execution.base import DispatchRepairResult, ExecutionCancelResult, ExternalReconciliationResult
 from litestar_queues.task import (
     ScheduleConfig,
     Task,
@@ -85,15 +92,6 @@ _RESOURCE_EXECUTION_BACKEND = "execution_backend"
 _RESOURCE_QUEUE_BACKEND = "queue_backend"
 _RESOURCE_SINK = "sink"
 _RESOURCE_SYNC_EXECUTOR = "sync_executor"
-_ROLLBACK_ORDER = (
-    _RESOURCE_SYNC_EXECUTOR,
-    _RESOURCE_BUFFER,
-    _RESOURCE_SINK,
-    _RESOURCE_EXECUTION_BACKEND,
-    _RESOURCE_EVENT_LOG,
-    _RESOURCE_QUEUE_BACKEND,
-    _RESOURCE_DEPENDENCY_PROVIDER,
-)
 _CLOSE_ORDER = (
     _RESOURCE_EXECUTION_BACKEND,
     _RESOURCE_EVENT_LOG,
@@ -136,6 +134,7 @@ class QueueService:
         "_event_publisher",
         "_execution_backend",
         "_is_open",
+        "_lifecycle_lock",
         "_logger",
         "_observability_runtime",
         "_opened_resources",
@@ -160,6 +159,7 @@ class QueueService:
         self._event_log: "QueueEventLog | None" = None
         self._event_publisher = event_publisher
         self._is_open = False
+        self._lifecycle_lock = asyncio.Lock()
         self._opened_resources: "frozenset[str]" = frozenset()
         if observability_runtime is None and config.observability is not None:
             from litestar_queues.observability import create_observability_runtime
@@ -240,6 +240,11 @@ class QueueService:
         Returns:
             The opened service.
         """
+        self._require_lifecycle_boundary()
+        async with self._lifecycle_lock:
+            return await self._open_resources()
+
+    async def _open_resources(self) -> "Self":
         if self._is_open:
             return self
         opened: "list[str]" = []
@@ -251,9 +256,11 @@ class QueueService:
             queue_backend = self.get_queue_backend()
             opened.append(_RESOURCE_QUEUE_BACKEND)
             await queue_backend.open()
-            self._configure_event_log(queue_backend)
-            if self._event_log is not None:
-                opened.append(_RESOURCE_EVENT_LOG)
+            try:
+                self._configure_event_log(queue_backend)
+            finally:
+                if self._event_log is not None:
+                    opened.append(_RESOURCE_EVENT_LOG)
             execution_backend = self.get_execution_backend()
             opened.append(_RESOURCE_EXECUTION_BACKEND)
             await execution_backend.open()
@@ -269,7 +276,7 @@ class QueueService:
                 )
                 opened.append(_RESOURCE_SYNC_EXECUTOR)
         except BaseException:
-            await self._teardown_resources(frozenset(opened), rollback=True, raise_errors=False)
+            await self._teardown_resources(frozenset(opened), raise_errors=False)
             raise
         self._opened_resources = frozenset(opened)
         self._is_open = True
@@ -277,17 +284,24 @@ class QueueService:
 
     async def close(self) -> "None":
         """Close queue and execution backends."""
-        opened = self._opened_resources
-        if not self._is_open and not opened:
-            return
-        self._opened_resources = frozenset()
-        self._is_open = False
-        await self._teardown_resources(opened, rollback=False, raise_errors=True)
+        self._require_lifecycle_boundary()
+        async with self._lifecycle_lock:
+            opened = self._opened_resources
+            if not self._is_open and not opened:
+                return
+            self._opened_resources = frozenset()
+            self._is_open = False
+            await self._teardown_resources(opened, raise_errors=True)
 
-    async def _teardown_resources(self, opened: "frozenset[str]", *, rollback: "bool", raise_errors: "bool") -> "None":
+    @staticmethod
+    def _require_lifecycle_boundary() -> "None":
+        if _in_event_release_callback():
+            message = "Queue service lifecycle cannot change from an active event release callback."
+            raise QueueConfigurationError(message)
+
+    async def _teardown_resources(self, opened: "frozenset[str]", *, raise_errors: "bool") -> "None":
         errors: "list[BaseException]" = []
-        order = _ROLLBACK_ORDER if rollback else _CLOSE_ORDER
-        for resource in order:
+        for resource in _CLOSE_ORDER:
             if resource in opened:
                 await self._teardown_resource(resource, errors)
         error = _select_lifecycle_error(errors)
@@ -299,7 +313,8 @@ class QueueService:
             if resource == _RESOURCE_EXECUTION_BACKEND and self._execution_backend is not None:
                 await self._execution_backend.close()
             elif resource == _RESOURCE_EVENT_LOG and self._event_log is not None:
-                await self._event_log.flush_events()
+                event_log, self._event_log = self._event_log, None
+                await event_log.aclose()
             elif resource == _RESOURCE_BUFFER and self._event_publisher is not None:
                 await self._event_publisher.stop_buffer()
             elif resource == _RESOURCE_QUEUE_BACKEND and self._queue_backend is not None:
@@ -328,7 +343,7 @@ class QueueService:
             )
             raise QueueConfigurationError(msg)
         self._event_log = event_log
-        self.get_event_publisher().set_event_log(event_log, strict=event_log_config.strict)
+        self.get_event_publisher().set_event_log(event_log)
 
     async def __aenter__(self) -> "Self":
         await self.open()
@@ -601,12 +616,21 @@ class QueueService:
 
         Returns:
             The live record.
+
+        Raises:
+            QueueDispatchError: If dispatch or the final reload fails after the
+                record was committed. The error retains the original task ID.
         """
         backend = self.get_execution_backend()
         if not backend.schedules_on_enqueue:
             return record
+        task_id = record.id
         await backend.schedule(self, record)
-        return await self.get_queue_backend().get_task(record.id) or record
+        try:
+            return await self.get_queue_backend().get_task(task_id) or record
+        except Exception as exc:
+            msg = f"Dispatched task {task_id} could not be reloaded."
+            raise QueueDispatchError(msg, task_id=task_id, committed=True) from exc
 
     def _execution_backend_for_name(self, name: "str") -> "BaseExecutionBackend":
         if name == execution_backend_name(self._config.execution_backend):
@@ -1023,11 +1047,41 @@ class QueueService:
 
         Returns:
             Number of records repaired or brought to a terminal queue status.
+
+        Raises:
+            QueueDispatchRepairError: If any bounded repair failed. The error
+                carries the structured result, including successful changes.
         """
         if limit is None:
             return await self._reconcile_external_records(limit=None)
+        result = await self.reconcile_external_result(limit=limit)
+        if result.repair.failed:
+            raise QueueDispatchRepairError(result)
+        return result.changed
+
+    async def reconcile_external_result(self, *, limit: "int") -> "ExternalReconciliationResult":
+        """Repair and reconcile external records within one shared allowance.
+
+        A zero allowance returns a deferred result without accessing storage or
+        the execution backend. Exhausting a repair page conservatively signals
+        more work may remain; it does not count a backlog. Provider calls are
+        not interrupted by the maintenance phase's time budget.
+
+        Returns:
+            Repair counts and the number of records reconciled afterward.
+
+        Raises:
+            QueueConfigurationError: If the allowance is negative.
+        """
+        if limit < 0:
+            msg = "External reconciliation limit must be non-negative."
+            raise QueueConfigurationError(msg)
+        if limit == 0:
+            return ExternalReconciliationResult(repair=DispatchRepairResult(limit_reached=True))
         repair = await self.get_execution_backend().repair(self, limit=limit)
-        return repair.changed + await self._reconcile_external_records(limit=max(0, limit - repair.examined))
+        remaining = max(0, limit - repair.examined)
+        reconciled = await self._reconcile_external_records(limit=remaining) if remaining else 0
+        return ExternalReconciliationResult(repair=repair, reconciled=reconciled)
 
     async def _reconcile_external_records(self, *, limit: "int | None") -> "int":
         """Reconcile outstanding external records against their execution backends.
@@ -1164,6 +1218,9 @@ class QueueService:
     async def initialize_schedules(self) -> "list[QueuedTaskRecord]":
         """Create queue records for registered recurring schedules.
 
+        New occurrences snapshot the registered retry budget. Reusing a
+        nonterminal occurrence preserves its existing budget and backoff.
+
         Returns:
             The created or reused schedule records.
         """
@@ -1190,7 +1247,7 @@ class QueueService:
                 await self._persist_scheduled_record(
                     task_name,
                     key=schedule_key,
-                    max_retries=0,
+                    max_retries=task_obj.retries,
                     priority=task_obj.priority,
                     scheduled_at=scheduled_at,
                     expires_at=_resolve_expires_at(
@@ -1287,6 +1344,7 @@ class QueueService:
         return await resolver(task, record, task_context)
 
     async def _reschedule_if_needed(self, record: "QueuedTaskRecord") -> "None":
+        """Create a successor with current retries, retaining the persisted backoff."""
         schedule_data = record.metadata.get("schedule")
         if not isinstance(schedule_data, dict) or record.completed_at is None:
             return
@@ -1311,7 +1369,7 @@ class QueueService:
             record.task_name,
             key=record.key,
             queue=record.queue,
-            max_retries=record.max_retries,
+            max_retries=task_obj.retries,
             priority=record.priority,
             scheduled_at=scheduled_at,
             expires_at=expires_at,

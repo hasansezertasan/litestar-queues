@@ -1,15 +1,20 @@
 """Unit tests for adopter-declared extra columns on the SQLSpec event-history table."""
 
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
 pytest.importorskip("sqlspec")
 pytest.importorskip("aiosqlite")
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlspec.adapters.aiosqlite import AiosqliteConfig
 
 from litestar_queues.backends.sqlspec import SQLSpecBackendConfig
+from litestar_queues.backends.sqlspec.backend import SQLSpecQueueBackend
 from litestar_queues.backends.sqlspec.event_log import SQLSpecQueueEventLogStore, create_event_log_store
 from litestar_queues.backends.sqlspec.schema import EVENT_HISTORY_COLUMNS
 from litestar_queues.events import EventHistoryExtraColumn, QueueEventQuery, validate_event_history_extra_columns
@@ -19,6 +24,75 @@ if TYPE_CHECKING:
     from litestar_queues.events import QueueEventLog
 
 _TENANT = EventHistoryExtraColumn(name="tenant_id", source="tenant_id", indexed=True)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_close_releases_all_owned_resources_after_history_failure(
+    cancel: "bool", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
+    backend = SQLSpecQueueBackend()
+    error = asyncio.CancelledError() if cancel else RuntimeError("history drain failed")
+    history = SimpleNamespace(aclose=AsyncMock(side_effect=error), flush_events=AsyncMock(side_effect=error))
+    pool: Any = SimpleNamespace(close_all_pools=AsyncMock(side_effect=RuntimeError("pool close failed")))
+    channel = SimpleNamespace(shutdown=AsyncMock())
+    executor = Mock()
+    heartbeat_executor = Mock()
+    backend._event_log = history  # type: ignore[assignment]
+    backend._sqlspec = pool
+    backend._event_channel = channel  # type: ignore[assignment]
+    monkeypatch.setattr(backend, "_sync_executor", executor)
+    monkeypatch.setattr(backend, "_heartbeat_sync_executor", heartbeat_executor)
+    backend._opened = True
+
+    async def fail_history_close() -> "None":
+        assert backend._event_log is None
+        assert id(backend._sqlspec) == id(pool)
+        pool.close_all_pools.assert_not_awaited()
+        raise error
+
+    history.aclose.side_effect = fail_history_close
+
+    with pytest.raises(type(error)) as raised:
+        await backend.close()
+
+    assert raised.value is error
+    history.aclose.assert_awaited_once()
+    pool.close_all_pools.assert_awaited_once()
+    channel.shutdown.assert_awaited_once()
+    executor.shutdown.assert_called_once_with(wait=True)
+    heartbeat_executor.shutdown.assert_called_once_with(wait=True)
+    assert backend._event_log is None
+    assert backend._sqlspec is None
+    assert backend._event_channel is None
+    assert backend._sync_executor is None
+    assert backend._heartbeat_sync_executor is None
+    assert backend._opened is False
+    await backend.close()
+    history.aclose.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_cancellation_during_pool_cleanup_survives_prior_history_error() -> "None":
+    backend = SQLSpecQueueBackend()
+    waiting = asyncio.Event()
+
+    async def close_pool() -> "None":
+        waiting.set()
+        await asyncio.Event().wait()
+
+    backend._event_log = SimpleNamespace(aclose=AsyncMock(side_effect=RuntimeError("history failed")))  # type: ignore[assignment]
+    backend._sqlspec = SimpleNamespace(close_all_pools=close_pool)  # type: ignore[assignment]
+    executor = Mock()
+    backend._sync_executor = executor
+    closing = asyncio.create_task(backend.close())
+    await asyncio.wait_for(waiting.wait(), timeout=1)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    executor.shutdown.assert_called_once_with(wait=True)
+    assert backend._event_log is None
+    assert backend._sqlspec is None
 
 
 def _store(*extra: "EventHistoryExtraColumn") -> "SQLSpecQueueEventLogStore":
@@ -298,6 +372,24 @@ def test_select_events_accepts_declared_extra_filter() -> "None":
     assert "tenant_id" in statement.build(dialect="sqlite").sql
 
 
+def test_event_count_excludes_page_window_and_preserves_extra_validation() -> None:
+    store = _store(_TENANT)
+    statement = (
+        store
+        .count_events(
+            QueueEventQuery(level="info", order="desc", limit=2, offset=8),
+            extra={"actor_id": "actor", "tenant_id": "tenant"},
+        )
+        .build(dialect="sqlite")
+        .sql.upper()
+    )
+    assert 'COUNT(*) AS "TOTAL"' in statement
+    assert all(clause not in statement for clause in ("ORDER BY", "LIMIT", "OFFSET"))
+    assert all(column in statement for column in ("LEVEL", "ACTOR_ID", "TENANT_ID"))
+    with pytest.raises(QueueConfigurationError):
+        store.count_events(QueueEventQuery(), extra={"unknown": "value"})
+
+
 def test_sqlspec_event_log_still_satisfies_the_frozen_protocol() -> "None":
     """The extra filter is additive: the concrete store still matches ``QueueEventLog``."""
     from litestar_queues.backends.sqlspec.event_log import SQLSpecQueueEventLog
@@ -307,3 +399,43 @@ def test_sqlspec_event_log_still_satisfies_the_frozen_protocol() -> "None":
 
     event_log = SQLSpecQueueEventLog.__new__(SQLSpecQueueEventLog)
     assert accepts_protocol(event_log) is event_log
+
+
+@pytest.mark.anyio
+async def test_arrow_history_second_row_failure_rolls_back_the_batch(monkeypatch: "pytest.MonkeyPatch") -> None:
+    from contextlib import asynccontextmanager
+
+    from sqlspec.exceptions import NotNullViolationError
+
+    import litestar_queues.backends.sqlspec.event_log as event_log_module
+    from litestar_queues.events import EventHistoryConfig, QueueEvent
+
+    monkeypatch.setattr(event_log_module, "_adapter_name", lambda _config: "arrow_odbc")
+    driver = AsyncMock()
+    driver.select.return_value = []
+    primary = NotNullViolationError("second row failed")
+    driver.execute.side_effect = [None, primary]
+
+    @asynccontextmanager
+    async def session() -> "Any":
+        yield driver
+
+    log = event_log_module.SQLSpecQueueEventLog(
+        session_factory=session,
+        datetime_serializer=lambda value: value,
+        config=EventHistoryConfig(strict=True),
+        store=_store(_TENANT),
+    )
+    records = [
+        log._record_from_event(QueueEvent(type="task.log", scope="task", payload={"tenant_id": str(index)}))
+        for index in range(2)
+    ]
+    with pytest.raises(NotNullViolationError) as caught:
+        await log._write_history_batch(records)
+    assert caught.value is primary
+    assert driver.execute.await_count == 2
+    assert [call.args[1]["tenant_id"] for call in driver.execute.await_args_list] == ["0", "1"]
+    driver.begin.assert_awaited_once()
+    driver.rollback.assert_awaited_once()
+    driver.commit.assert_not_awaited()
+    driver.execute_many.assert_not_awaited()
