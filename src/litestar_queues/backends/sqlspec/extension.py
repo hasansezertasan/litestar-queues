@@ -32,7 +32,11 @@ _EVENTS_EXTENSION_NAME = "events"
 
 
 def configure_events_migration_extension(
-    sqlspec_config: "SQLSpecConfig", *, backend: "str", queue_table: "str | None" = None
+    sqlspec_config: "SQLSpecConfig",
+    *,
+    backend: "str | None",
+    queue_table: "str | None" = None,
+    manage_schema: "bool" = True,
 ) -> "None":
     """Register SQLSpec's events queue migration for native wakeup provisioning.
 
@@ -40,7 +44,23 @@ def configure_events_migration_extension(
     events queue migration on migrate-up, so a capability-native backend gets its
     durable events queue table with no manual step. Existing events settings are
     preserved; only unset keys are filled in.
+
+    The events queue table is package-owned, so ``manage_schema=False`` leaves
+    nothing registered: any events settings and packaged revision already on the
+    config are removed, so an application that owns its schema receives no
+    packaged revision whatever ran before. That holds whether or not a durable
+    events table would otherwise be provisioned.
+
+    A ``backend`` of ``None`` means no durable events table is needed and leaves
+    the config untouched. The events extension is SQLSpec's own rather than this
+    package's, so an application may have registered it for its own use, and a
+    transport that needs no events table is not grounds for removing it.
     """
+    if not manage_schema:
+        _deregister_extension(sqlspec_config, _EVENTS_EXTENSION_NAME)
+        return
+    if backend is None:
+        return
     extension_config = dict(sqlspec_config.extension_config or {})
     events_settings = dict(extension_config.get(_EVENTS_EXTENSION_NAME, {}) or {})
     events_settings.setdefault("backend", backend)
@@ -66,8 +86,19 @@ def configure_queue_migration_extension(
     maintenance_table_name: "str | None" = None,
     task_reservation_table_name: "str | None" = None,
     column_map: "Mapping[str, str] | None" = None,
+    manage_schema: "bool" = True,
 ) -> "None":
-    """Register the packaged queue migrations with SQLSpec's extension runner."""
+    """Register the packaged queue migrations with SQLSpec's extension runner.
+
+    ``manage_schema=False`` declares that the application owns the queue schema,
+    so nothing stays registered: no extension settings, no migration directory,
+    and therefore no packaged revision for SQLSpec to discover or apply. A
+    registration written by an earlier call on the same config is removed, so the
+    postcondition holds regardless of call order.
+    """
+    if not manage_schema:
+        _deregister_extension(sqlspec_config, QUEUE_EXTENSION_NAME)
+        return
     queue_settings = _configure_extension_settings(
         sqlspec_config,
         queue_table_name=queue_table_name,
@@ -85,6 +116,33 @@ def configure_queue_migration_extension(
     runner.extension_migrations[QUEUE_EXTENSION_NAME] = queue_migration_directory()
     runner.extension_configs[QUEUE_EXTENSION_NAME] = queue_settings
 
+    if runner.context is not None:
+        runner.context.extension_config = commands.extension_configs
+
+
+def _deregister_extension(sqlspec_config: "SQLSpecConfig", extension_name: "str") -> "None":
+    """Remove every trace of an extension registration from a SQLSpec config.
+
+    ``SQLSpecConfig`` caches its ``MigrationCommands``, so settings written by an
+    earlier ``manage_schema=True`` call outlive a later skip and keep the packaged
+    revision discoverable. Removal covers the cached commands, the migration
+    runner, the config's extension settings, and SQLSpec's auto-included extension
+    list, and does nothing when the extension was never registered.
+    """
+    extension_config = sqlspec_config.extension_config or {}
+    if extension_name in extension_config:
+        remaining = dict(extension_config)
+        del remaining[extension_name]
+        sqlspec_config.extension_config = remaining
+    migration_config = sqlspec_config.migration_config or {}
+    included = migration_config.get("include_extensions")
+    if included is not None and extension_name in included:
+        migration_config["include_extensions"] = [name for name in included if name != extension_name]
+    commands = sqlspec_config.get_migration_commands()
+    commands.extension_configs.pop(extension_name, None)
+    runner = commands.runner
+    runner.extension_configs.pop(extension_name, None)
+    runner.extension_migrations.pop(extension_name, None)
     if runner.context is not None:
         runner.context.extension_config = commands.extension_configs
 
